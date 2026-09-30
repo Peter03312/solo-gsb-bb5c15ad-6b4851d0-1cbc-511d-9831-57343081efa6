@@ -61,3 +61,15 @@ class BatchApprovalRequest(BaseModel):
 
 class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
+
+
+class GuardBandPreviewRequest(BaseModel):
+    # Proposed non-negative protection bandwidth.  Preview is non-mutating;
+    # the handler explicitly rejects non-finite values (float accepts NaN).
+    proposed_guard_band: float
+
+
+class GuardBandConfirmRequest(GuardBandPreviewRequest):
+    # Same value as the preview plus the revision the preview was based on;
+    # the change shares the singleton revision lock with approve/revoke.
+    expected_revision: int = Field(ge=0)

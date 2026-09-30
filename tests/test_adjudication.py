@@ -8,6 +8,7 @@ from app.adjudication import (
     circles_intersect,
     closed_intervals_intersect,
     evaluate,
+    evaluate_effective_pairs,
     evaluate_group,
     frequency_conflicts,
     half_open_intervals_intersect,
@@ -186,3 +187,42 @@ class TestEvaluateGroup:
         _, within = evaluate_group(members, [], 2.0)
         assert within[1][0].reason == REASON_WITHIN_GUARD_BAND
         assert within[1][0].minimum_frequency_gap == 1.0
+
+
+class TestEvaluateEffectivePairs:
+    def test_empty_and_single_set_have_no_pairs(self):
+        assert evaluate_effective_pairs([], 5.0) == []
+        assert evaluate_effective_pairs([lic(1)], 5.0) == []
+
+    def test_clean_pair_under_small_band_conflicts_under_larger_band(self):
+        # gap 2.0: allowed at band 2.0 (strictly smaller), clash at 2.5.
+        licenses = [lic(1, flo=100, fhi=110), lic(2, flo=112, fhi=120)]
+        assert evaluate_effective_pairs(licenses, 2.0) == []
+        pairs = evaluate_effective_pairs(licenses, 2.5)
+        assert len(pairs) == 1
+        subject, other, conflict = pairs[0]
+        assert subject.application_id == 1
+        assert other.application_id == 2
+        assert conflict.reason == REASON_WITHIN_GUARD_BAND
+        assert conflict.minimum_frequency_gap == 2.0
+
+    def test_pairs_are_unordered_and_deterministic(self):
+        licenses = [
+            lic(1, flo=100, fhi=101),
+            lic(2, flo=100, fhi=101),
+            lic(3, flo=100, fhi=101),
+        ]
+        pairs = evaluate_effective_pairs(licenses, 0.0)
+        assert [(s.application_id, o.application_id) for s, o, _ in pairs] == [
+            (1, 2),
+            (1, 3),
+            (2, 3),
+        ]
+
+    def test_time_or_area_disjoint_pair_is_not_reported(self):
+        # adjacent half-open windows -> never interfere regardless of band
+        licenses = [
+            lic(1, start=T0, end=T1),
+            lic(2, start=T1, end=T3, flo=100, fhi=101),
+        ]
+        assert evaluate_effective_pairs(licenses, 1000.0) == []

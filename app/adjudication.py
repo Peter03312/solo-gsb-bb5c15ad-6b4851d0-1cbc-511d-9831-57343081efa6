@@ -152,6 +152,27 @@ def evaluate(
     return conflicts
 
 
+def evaluate_effective_pairs(
+    effective: list[License], guard_band: float
+) -> list[tuple[License, License, Conflict]]:
+    """Every interfering unordered pair within the effective set.
+
+    Used to validate a proposed guard-band change: a value that makes any two
+    currently effective licenses interfere must be rejected.  Each pair is
+    returned as ``(subject, other, conflict)`` ordered by the input list's
+    ordering (the persistence layer loads licenses by application id, so the
+    result is deterministic); the conflict describes ``subject`` against
+    ``other``.
+    """
+    pairs: list[tuple[License, License, Conflict]] = []
+    for i in range(len(effective)):
+        for j in range(i + 1, len(effective)):
+            conflicts = evaluate(effective[i], [effective[j]], guard_band)
+            if conflicts:
+                pairs.append((effective[i], effective[j], conflicts[0]))
+    return pairs
+
+
 def evaluate_group(
     candidates: list[License], effective: list[License], guard_band: float
 ) -> tuple[dict[int, list[Conflict]], dict[int, list[Conflict]]]:

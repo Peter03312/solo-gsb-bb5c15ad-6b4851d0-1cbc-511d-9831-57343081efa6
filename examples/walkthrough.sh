@@ -95,3 +95,36 @@ post /api/applications/batch-approve \
   "{\"expected_revision\":6,\"application_ids\":[$F_ID,$F_ID]}" | J || true
 post /api/applications/batch-approve \
   "{\"expected_revision\":6,\"application_ids\":[999999]}" | J || true
+
+echo "== 16. preview guard band 100 MHz (state unchanged; two effective pairs clash) =="
+post /api/guard-band/preview '{"proposed_guard_band":100}' | J
+
+echo "== 17. confirm 100 MHz at revision 6 -> interference, band/revision/set unchanged =="
+post /api/guard-band/confirm \
+  '{"expected_revision":6,"proposed_guard_band":100}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "guard_band =", d["guard_band"])'
+
+echo "== 18. invalid proposed values are rejected explicitly (422 envelope) =="
+post /api/guard-band/preview '{"proposed_guard_band":-1}' | J || true
+post /api/guard-band/confirm '{"expected_revision":6,"proposed_guard_band":-1}' | J || true
+
+echo "== 19. stale confirmation -> stale_revision =="
+post /api/guard-band/confirm '{"expected_revision":0,"proposed_guard_band":50}' | J || true
+
+echo "== 20. confirm 50 MHz at revision 6 -> exactly one new revision (7) =="
+post /api/guard-band/confirm \
+  '{"expected_revision":6,"proposed_guard_band":50}' | J
+
+echo "== 21. history restores the band per revision; past decision bands are untouched =="
+curl -s "$BASE/api/revision/6" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("revision 6 guard_band =", d["guard_band"])
+print("approval decision bands =", [a["guard_band"] for a in d["approvals"]])'
+curl -s "$BASE/api/revision/7" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("revision 7 guard_band =", d["guard_band"])
+print("guard_band_changes =", [(c["revision"], c["guard_band"]) for c in d["guard_band_changes"]])
+print("approval decision bands still =", [a["guard_band"] for a in d["approvals"]])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "guard_band =", d["guard_band"])'

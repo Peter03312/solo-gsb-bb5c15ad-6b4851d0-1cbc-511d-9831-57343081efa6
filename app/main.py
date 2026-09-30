@@ -9,6 +9,8 @@ POST   /api/applications/{id}/preview    conflicts + current revision
 POST   /api/applications/{id}/approve    conditional approval (expected rev.)
 POST   /api/applications/batch-approve   atomic group approval (expected rev.)
 POST   /api/applications/{id}/revoke     revoke (changes future effective set)
+POST   /api/guard-band/preview           preview a proposed guard-band value
+POST   /api/guard-band/confirm           online guard-band change (expected rev.)
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (approvals/revocations)
 GET    /health                           liveness probe
@@ -17,14 +19,18 @@ Concurrency
 -----------
 Approval locks the singleton ``revision_meta`` row (``SELECT ... FOR UPDATE``)
 for the duration of the transaction.  Concurrent single approvals, batch
-approvals and revocations therefore serialise on the same revision arbitration:
-losers re-adjudicate against the winner's commit and are refused with
-``stale_revision`` or ``interference``.  A batch either consumes one
-consecutive revision per member in input order, or nothing at all.
+approvals, revocations and guard-band confirmations therefore serialise on
+the same revision arbitration: losers re-adjudicate against the winner's
+commit and are refused with ``stale_revision`` or ``interference``.  A batch
+either consumes one consecutive revision per member in input order, or
+nothing at all.  A confirmed guard-band change consumes exactly one revision
+and the new value governs every later decision; the band stored on each
+historical approval event is never rewritten.
 """
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -42,6 +48,7 @@ from .errors import APIError, api_error_handler
 from .models import (
     Application,
     ApprovalEvent,
+    GuardBandEvent,
     RevisionMeta,
     RevocationEvent,
 )
@@ -49,6 +56,8 @@ from .schemas import (
     ApplicationCreate,
     ApprovalRequest,
     BatchApprovalRequest,
+    GuardBandConfirmRequest,
+    GuardBandPreviewRequest,
     RevocationRequest,
 )
 from .semantic_validation import validate_application
@@ -93,30 +102,40 @@ def serialize_application(app: Application) -> dict[str, Any]:
     }
 
 
-def serialize_conflict(conflict: Conflict) -> dict[str, Any]:
-    """One conflicting effective grant with the trigger conditions."""
+def serialize_license(lic: License) -> dict[str, Any]:
+    """The geometry/frequency/time fields of a license (no status fields)."""
+    return {
+        "id": lic.application_id,
+        "circle": {
+            "cx": lic.circle.cx,
+            "cy": lic.circle.cy,
+            "radius": lic.circle.radius,
+        },
+        "frequency": {"low": lic.freq_low, "high": lic.freq_high},
+        "time_window": {
+            "start": iso(lic.start_time),
+            "end": iso(lic.end_time),
+        },
+    }
+
+
+def serialize_conflict(conflict: Conflict, guard_band: float) -> dict[str, Any]:
+    """One conflicting effective grant with the trigger conditions.
+
+    ``guard_band`` is the value the trigger flags are computed against:
+    previews use the band currently in force, guard-band previews the
+    proposed value, and stored historical decisions their own snapshot band.
+    """
     other = conflict.other
     return {
-        "application": {
-            "id": other.application_id,
-            "circle": {
-                "cx": other.circle.cx,
-                "cy": other.circle.cy,
-                "radius": other.circle.radius,
-            },
-            "frequency": {"low": other.freq_low, "high": other.freq_high},
-            "time_window": {
-                "start": iso(other.start_time),
-                "end": iso(other.end_time),
-            },
-        },
+        "application": serialize_license(other),
         "trigger": {
             "time_intersect": conflict.time_overlap,
             "area_intersect": conflict.area_overlap,
             "frequency_intersect": conflict.frequency_intersects,
             "minimum_frequency_gap": conflict.minimum_frequency_gap,
             "within_guard_band": (
-                conflict.minimum_frequency_gap < settings.guard_band
+                conflict.minimum_frequency_gap < guard_band
             ),
         },
         "reason": conflict.reason,
@@ -134,7 +153,9 @@ def to_license(app: Application) -> License:
     )
 
 
-def serialize_group_conflict(conflict: Conflict, scope: str) -> dict[str, Any]:
+def serialize_group_conflict(
+    conflict: Conflict, scope: str, guard_band: float
+) -> dict[str, Any]:
     """A conflict inside a group decision, tagged with where it came from.
 
     ``scope`` is ``"effective"`` when the other side is a currently valid
@@ -142,9 +163,30 @@ def serialize_group_conflict(conflict: Conflict, scope: str) -> dict[str, Any]:
     The body is the same shape as a preview conflict so existing clients can
     reuse their rendering.
     """
-    body = serialize_conflict(conflict)
+    body = serialize_conflict(conflict, guard_band)
     body["scope"] = scope
     return body
+
+
+def serialize_pair_conflict(
+    subject: License, other: License, conflict: Conflict, guard_band: float
+) -> dict[str, Any]:
+    """One interfering pair within the effective set for a proposed band.
+
+    Mirrors a preview conflict, with the pair spelled out explicitly so the
+    operator can see both sides without reconstructing the subject.
+    """
+    return {
+        "applications": [serialize_license(subject), serialize_license(other)],
+        "trigger": {
+            "time_intersect": conflict.time_overlap,
+            "area_intersect": conflict.area_overlap,
+            "frequency_intersect": conflict.frequency_intersects,
+            "minimum_frequency_gap": conflict.minimum_frequency_gap,
+            "within_guard_band": conflict.minimum_frequency_gap < guard_band,
+        },
+        "reason": conflict.reason,
+    }
 
 
 def load_effective_licenses(session) -> list[License]:
@@ -156,6 +198,48 @@ def load_effective_licenses(session) -> list[License]:
         .all()
     )
     return [to_license(row) for row in rows]
+
+
+def validate_guard_band_value(value: float) -> list[dict[str, Any]]:
+    """Reject invalid proposed guard-band values the same way applications
+    are rejected: an explicit list of violations in the standard envelope.
+
+    Pydantic's ``float`` accepts NaN/+-inf, so finiteness is checked here;
+    the band must also be non-negative.
+    """
+    violations: list[dict[str, Any]] = []
+    if not math.isfinite(value):
+        violations.append(
+            {
+                "field": "proposed_guard_band",
+                "code": "value_not_finite",
+                "message": "proposed_guard_band must be a finite number",
+            }
+        )
+    elif value < 0:
+        violations.append(
+            {
+                "field": "proposed_guard_band",
+                "code": "guard_band_negative",
+                "message": "proposed_guard_band must be non-negative",
+            }
+        )
+    return violations
+
+
+def guard_band_at(session, revision: int) -> float:
+    """Guard band in force at ``revision``: latest change event <= revision.
+
+    Revision 0 always carries a seed event (see db.init_db), so this never
+    fails for valid revisions.
+    """
+    event = (
+        session.query(GuardBandEvent)
+        .filter(GuardBandEvent.revision <= revision)
+        .order_by(GuardBandEvent.revision.desc())
+        .first()
+    )
+    return event.guard_band if event is not None else settings.guard_band
 
 
 # --------------------------------------------------------------------------- #
@@ -213,8 +297,25 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         for ev in revocations
     ]
 
+    guard_band_changes = [
+        {
+            "revision": ev.revision,
+            "guard_band": ev.guard_band,
+            "created_at": iso(ev.created_at),
+        }
+        for ev in session.query(GuardBandEvent)
+        .filter(GuardBandEvent.revision <= revision)
+        .order_by(GuardBandEvent.revision)
+        .all()
+    ]
+    # The band in force at the target revision is the latest change up to it
+    # (revision 0 always has the seed row).
+    guard_band = guard_band_changes[-1]["guard_band"] if guard_band_changes else None
+
     return {
         "revision": revision,
+        "guard_band": guard_band,
+        "guard_band_changes": guard_band_changes,
         "effective_application_ids": effective_ids,
         "approvals": approval_records,
         "revocations": revocation_records,
@@ -228,8 +329,15 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
 async def lifespan(app: FastAPI):
     wait_for_database()
     init_db()
+    with SessionLocal() as session:
+        meta = session.get(RevisionMeta, 1)
+        active_band = meta.guard_band if meta is not None else settings.guard_band
+        revision = meta.revision if meta is not None else 0
     log.info(
-        "startup complete; guard_band=%s listening on %s:%s",
+        "startup complete; revision=%s guard_band=%s (GUARD_BAND env %s only "
+        "seeds a brand-new database) listening on %s:%s",
+        revision,
+        active_band,
         settings.guard_band,
         settings.app_host,
         settings.app_port,
@@ -289,6 +397,7 @@ def current_revision() -> dict[str, Any]:
     with SessionLocal() as session:
         meta = session.get(RevisionMeta, 1)
         revision = meta.revision if meta else 0
+        current_band = meta.guard_band if meta is not None else settings.guard_band
         snapshot = build_snapshot(session, revision)
         effective_applications = [
             serialize_application(app)
@@ -297,7 +406,8 @@ def current_revision() -> dict[str, Any]:
         ]
     return {
         "current_revision": revision,
-        "guard_band": settings.guard_band,
+        "guard_band": current_band,
+        "guard_band_changes": snapshot["guard_band_changes"],
         "effective_application_ids": snapshot["effective_application_ids"],
         "effective_applications": effective_applications,
         "approvals": snapshot["approvals"],
@@ -409,15 +519,16 @@ def preview_application(application_id: int) -> dict[str, Any]:
             )
 
         current = session.get(RevisionMeta, 1).revision
+        current_band = guard_band_at(session, current)
         effective = load_effective_licenses(session)
-        conflicts = adjudication.evaluate(to_license(row), effective, settings.guard_band)
+        conflicts = adjudication.evaluate(to_license(row), effective, current_band)
 
     return {
         "application_id": application_id,
         "current_revision": current,
-        "guard_band": settings.guard_band,
+        "guard_band": current_band,
         "has_conflicts": bool(conflicts),
-        "conflicts": [serialize_conflict(c) for c in conflicts],
+        "conflicts": [serialize_conflict(c, current_band) for c in conflicts],
     }
 
 
@@ -471,10 +582,13 @@ def approve_application(
                         },
                     )
 
-                # Re-adjudicate under the lock against the latest effective set.
+                # Re-adjudicate under the lock against the latest effective
+                # set, using the guard band currently in force (it may have
+                # been changed online at an earlier revision).
                 effective = load_effective_licenses(session)
+                current_band = meta.guard_band
                 conflicts = adjudication.evaluate(
-                    to_license(row), effective, settings.guard_band
+                    to_license(row), effective, current_band
                 )
                 if conflicts:
                     raise APIError(
@@ -484,8 +598,9 @@ def approve_application(
                         status_code=409,
                         details={
                             "current_revision": current,
+                            "guard_band": current_band,
                             "conflicts": [
-                                serialize_conflict(c) for c in conflicts
+                                serialize_conflict(c, current_band) for c in conflicts
                             ],
                         },
                     )
@@ -495,7 +610,8 @@ def approve_application(
                     ApprovalEvent(
                         revision=meta.revision,
                         application_id=application_id,
-                        guard_band=settings.guard_band,
+                        # Snapshot the band in force: never rewritten later.
+                        guard_band=current_band,
                     )
                 )
                 row.status = "approved"
@@ -505,7 +621,7 @@ def approve_application(
                     "approved": True,
                     "application_id": application_id,
                     "revision": meta.revision,
-                    "guard_band": settings.guard_band,
+                    "guard_band": current_band,
                     "application": serialize_application(row),
                 }
         except IntegrityError:
@@ -666,17 +782,18 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                 ordered_rows = [rows_by_id[i] for i in payload.application_ids]
                 candidates = [to_license(row) for row in ordered_rows]
                 effective = load_effective_licenses(session)
+                current_band = meta.guard_band
                 against_effective, within_group = adjudication.evaluate_group(
-                    candidates, effective, settings.guard_band
+                    candidates, effective, current_band
                 )
                 interference_details = []
                 for candidate in candidates:
                     eff_conflicts = [
-                        serialize_group_conflict(c, "effective")
+                        serialize_group_conflict(c, "effective", current_band)
                         for c in against_effective[candidate.application_id]
                     ]
                     group_conflicts = [
-                        serialize_group_conflict(c, "group")
+                        serialize_group_conflict(c, "group", current_band)
                         for c in within_group[candidate.application_id]
                     ]
                     if eff_conflicts or group_conflicts:
@@ -711,7 +828,7 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                         ApprovalEvent(
                             revision=meta.revision,
                             application_id=row.id,
-                            guard_band=settings.guard_band,
+                            guard_band=current_band,
                         )
                     )
                     row.status = "approved"
@@ -732,7 +849,7 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                     # Headline final revision, same field name as single
                     # approve/revoke responses.
                     "revision": meta.revision,
-                    "guard_band": settings.guard_band,
+                    "guard_band": current_band,
                     "application_ids": payload.application_ids,
                     "results": results,
                 }
@@ -748,6 +865,147 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                 "re-preview and re-decide; the whole batch was rejected",
                 status_code=409,
                 details={"current_revision": latest},
+            )
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Guard band: non-mutating preview and online confirmation
+# --------------------------------------------------------------------------- #
+@app.post("/api/guard-band/preview", tags=["guard-band"])
+def preview_guard_band(payload: GuardBandPreviewRequest) -> dict[str, Any]:
+    """Preview a proposed guard band without changing any state.
+
+    Returns the current revision, the band in force and every unordered pair
+    of currently effective licenses that would interfere under the proposed
+    value, with the trigger conditions of each pair.
+    """
+    violations = validate_guard_band_value(payload.proposed_guard_band)
+    if violations:
+        raise APIError(
+            E_VALIDATION,
+            "the proposed guard band was rejected due to an invalid value",
+            status_code=422,
+            details=violations,
+        )
+
+    with SessionLocal() as session:
+        meta = session.get(RevisionMeta, 1)
+        current = meta.revision
+        current_band = meta.guard_band
+        effective = load_effective_licenses(session)
+        pairs = adjudication.evaluate_effective_pairs(
+            effective, payload.proposed_guard_band
+        )
+        conflicts = [
+            serialize_pair_conflict(subject, other, conflict, payload.proposed_guard_band)
+            for subject, other, conflict in pairs
+        ]
+
+    return {
+        "current_revision": current,
+        "current_guard_band": current_band,
+        "proposed_guard_band": payload.proposed_guard_band,
+        "has_conflicts": bool(conflicts),
+        "effective_application_ids": [lic.application_id for lic in effective],
+        "conflicts": conflicts,
+    }
+
+
+@app.post("/api/guard-band/confirm", tags=["guard-band"])
+def confirm_guard_band(payload: GuardBandConfirmRequest) -> dict[str, Any]:
+    """Confirm an online guard-band change under the shared revision lock.
+
+    The same proposed value and the revision returned by the preview are
+    required.  The change is rejected (revision, band and effective set all
+    unchanged) when the revision is stale or the proposed value makes any
+    pair of currently effective licenses interfere.  On success it consumes
+    exactly one revision; subsequent previews and approvals use the new band.
+    """
+    violations = validate_guard_band_value(payload.proposed_guard_band)
+    if violations:
+        raise APIError(
+            E_VALIDATION,
+            "the proposed guard band was rejected due to an invalid value",
+            status_code=422,
+            details=violations,
+        )
+
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as approve/batch/revoke.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                # Stale revision is checked first, exactly like approvals.
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-preview and re-decide",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                # Re-adjudicate the whole effective set under the lock.
+                effective = load_effective_licenses(session)
+                pairs = adjudication.evaluate_effective_pairs(
+                    effective, payload.proposed_guard_band
+                )
+                if pairs:
+                    conflicts = [
+                        serialize_pair_conflict(
+                            subject,
+                            other,
+                            conflict,
+                            payload.proposed_guard_band,
+                        )
+                        for subject, other, conflict in pairs
+                    ]
+                    raise APIError(
+                        E_INTERFERENCE,
+                        f"proposed guard band makes {len(conflicts)} effective "
+                        "license pair(s) interfere; the guard band was not changed",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                            "current_guard_band": meta.guard_band,
+                            "proposed_guard_band": payload.proposed_guard_band,
+                            "conflicts": conflicts,
+                        },
+                    )
+
+                meta.revision = current + 1
+                meta.guard_band = payload.proposed_guard_band
+                session.add(
+                    GuardBandEvent(
+                        revision=meta.revision,
+                        guard_band=payload.proposed_guard_band,
+                    )
+                )
+                session.flush()
+                response = {
+                    "changed": True,
+                    "revision": meta.revision,
+                    "previous_guard_band": guard_band_at(session, current),
+                    "guard_band": payload.proposed_guard_band,
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer won the revision slot.
+            session.rollback()
+            latest_meta = session.get(RevisionMeta, 1)
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest_meta.revision}); "
+                "re-preview and re-decide",
+                status_code=409,
+                details={"current_revision": latest_meta.revision},
             )
     return response
 
