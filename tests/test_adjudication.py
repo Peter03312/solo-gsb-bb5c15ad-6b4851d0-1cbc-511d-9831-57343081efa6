@@ -9,6 +9,7 @@ from app.adjudication import (
     closed_intervals_intersect,
     evaluate,
     evaluate_group,
+    find_interfering_pairs,
     frequency_conflicts,
     half_open_intervals_intersect,
     minimum_frequency_gap,
@@ -186,3 +187,57 @@ class TestEvaluateGroup:
         _, within = evaluate_group(members, [], 2.0)
         assert within[1][0].reason == REASON_WITHIN_GUARD_BAND
         assert within[1][0].minimum_frequency_gap == 1.0
+
+
+class TestFindInterferingPairs:
+    def test_no_pairs_when_clean(self):
+        members = [lic(1, flo=100, fhi=110), lic(2, flo=200, fhi=210)]
+        assert find_interfering_pairs(members, 2.0) == []
+
+    def test_pair_detected_with_trigger_details(self):
+        a, b = lic(1, flo=100, fhi=110), lic(2, flo=111, fhi=112)
+        (pair,) = find_interfering_pairs([a, b], 2.0)
+        assert pair.first is a and pair.second is b
+        assert pair.reason == REASON_WITHIN_GUARD_BAND
+        assert pair.minimum_frequency_gap == 1.0
+        assert pair.time_overlap and pair.area_overlap
+        assert not pair.frequency_intersects
+
+    def test_frequency_intersection_pair(self):
+        pairs = find_interfering_pairs(
+            [lic(1, flo=100, fhi=110), lic(2, flo=105, fhi=115)], 2.0
+        )
+        assert len(pairs) == 1
+        assert pairs[0].reason == REASON_FREQUENCY_INTERSECTION
+        assert pairs[0].frequency_intersects
+
+    def test_pair_requires_time_and_area(self):
+        # frequencies overlap but areas are disjoint -> no pair
+        assert find_interfering_pairs(
+            [lic(1), lic(2, cx=100.0, r=1.0)], 5.0
+        ) == []
+        # half-open time windows merely touching -> no pair
+        assert find_interfering_pairs(
+            [lic(1, end=T1), lic(2, start=T1, end=T3)], 5.0
+        ) == []
+
+    def test_every_interfering_combination_reported_once_in_order(self):
+        members = [
+            lic(1, flo=100, fhi=110),
+            lic(2, flo=105, fhi=115),
+            lic(3, flo=300, fhi=301),
+            lic(4, flo=108, fhi=109),
+        ]
+        pairs = find_interfering_pairs(members, 2.0)
+        assert [(p.first.application_id, p.second.application_id) for p in pairs] == [
+            (1, 2),
+            (1, 4),
+            (2, 4),
+        ]
+
+    def test_gap_equal_to_proposed_band_is_allowed(self):
+        # Strictly-smaller rule: gap 2 == proposed band 2 -> no pair.
+        members = [lic(1, flo=100, fhi=110), lic(2, flo=112, fhi=120)]
+        assert find_interfering_pairs(members, 2.0) == []
+        (pair,) = find_interfering_pairs(members, 2.5)
+        assert pair.minimum_frequency_gap == 2.0

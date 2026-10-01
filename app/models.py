@@ -2,15 +2,22 @@
 
 History is event-sourced:
 
-* ``applications``     - every submitted request, rejected submissions are
-                         never persisted (see whole-request validation);
-* ``approval_events``  - append-only approval record, one per revision;
-* ``revocation_events``- append-only revocation record, one per revision;
-* ``revision_meta``    - singleton row holding the current revision number.
+* ``applications``      - every submitted request, rejected submissions are
+                          never persisted (see whole-request validation);
+* ``approval_events``   - append-only approval record, one per revision;
+* ``revocation_events`` - append-only revocation record, one per revision;
+* ``guard_band_events`` - append-only guard-band record, one per revision
+                          (revision 0 is the initial value seeded at database
+                          creation, every later row is one confirmed online
+                          change);
+* ``revision_meta``     - singleton row holding the current revision number
+                          and the guard band currently in force.
 
 A revocation never deletes history: it only removes an application from the
 effective set used by later adjudications.  Snapshots for any past revision
-are reconstructed from the two event tables.
+are reconstructed from the event tables, including the guard band in force
+at that revision.  Approval events keep their own immutable copy of the
+band they were decided under and are never rewritten.
 """
 from __future__ import annotations
 
@@ -102,10 +109,36 @@ class RevocationEvent(Base):
     __table_args__ = (Index("ix_revocation_events_application", "application_id"),)
 
 
+class GuardBandEvent(Base):
+    """Append-only guard-band record, one per revision.
+
+    The row at revision 0 is the initial value seeded when the database was
+    created (``previous_guard_band`` is NULL there); every later row is one
+    confirmed online change and consumes exactly one revision, sharing the
+    revision sequence with approvals and revocations.
+    """
+
+    __tablename__ = "guard_band_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    previous_guard_band: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
 class RevisionMeta(Base):
-    """Singleton row (id == 1) holding the current revision number."""
+    """Singleton row (id == 1): current revision + live guard band."""
 
     __tablename__ = "revision_meta"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Live guard band used by every new adjudication.  Seeded once from the
+    # GUARD_BAND environment variable; afterwards only changed through the
+    # online config endpoint and never overwritten at startup.
+    guard_band: Mapped[float] = mapped_column(Float, nullable=False)

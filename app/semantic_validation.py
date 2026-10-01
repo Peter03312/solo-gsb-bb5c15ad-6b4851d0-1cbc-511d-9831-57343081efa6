@@ -14,6 +14,7 @@ FREQUENCY_LOW_ABOVE_HIGH = "frequency_low_above_high"
 TIME_START_NOT_BEFORE_END = "time_start_not_before_end"
 VALUE_NOT_FINITE = "value_not_finite"
 NAIVE_DATETIME = "naive_datetime"
+GUARD_BAND_NEGATIVE = "guard_band_negative"
 
 
 def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
@@ -74,4 +75,26 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
             }
         )
 
+    return errors
+
+
+def validate_guard_band(value: float) -> list[dict[str, str]]:
+    """A guard band must be a finite, non-negative number."""
+    errors: list[dict[str, str]] = []
+    if not math.isfinite(value):
+        errors.append(
+            {
+                "field": "guard_band",
+                "code": VALUE_NOT_FINITE,
+                "message": "guard_band must be a finite number",
+            }
+        )
+    elif value < 0:
+        errors.append(
+            {
+                "field": "guard_band",
+                "code": GUARD_BAND_NEGATIVE,
+                "message": "guard_band must be non-negative",
+            }
+        )
     return errors

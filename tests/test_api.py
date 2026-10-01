@@ -527,3 +527,300 @@ class TestBatchApprove:
         assert r.status_code == 409
         assert r.json()["error"]["code"] == "already_revoked"
         assert client.get(f"/api/applications/{b}").json()["status"] == "pending"
+
+
+class TestGuardBandConfig:
+    """Online guard-band configuration: preview, confirm, history."""
+
+    CONFIG = "/api/config/guard-band"
+    PREVIEW = "/api/config/guard-band/preview"
+
+    def _submit(self, client, name, **kw):
+        return client.post(
+            "/api/applications", json=body(name=name, **kw)
+        ).json()["id"]
+
+    def _approve(self, client, app_id, expected):
+        r = client.post(
+            f"/api/applications/{app_id}/approve",
+            json={"expected_revision": expected},
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_initial_config_seeded_from_env(self, client):
+        # conftest sets GUARD_BAND=2.0; a fresh database adopts it once.
+        r = client.get(self.CONFIG)
+        assert r.status_code == 200
+        assert r.json() == {
+            "current_revision": 0,
+            "guard_band": 2.0,
+            "initial_guard_band": 2.0,
+        }
+        current = client.get("/api/revision/current").json()
+        assert current["guard_band"] == 2.0
+
+    def test_preview_reports_pairs_and_does_not_mutate(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        b = self._submit(client, "B", freq=(113, 114))  # gap 3 >= guard 2
+        self._approve(client, a, 0)
+        self._approve(client, b, 1)
+
+        r = client.post(self.PREVIEW, json={"guard_band": 4.0})
+        assert r.status_code == 200
+        body_ = r.json()
+        assert body_["current_revision"] == 2
+        assert body_["current_guard_band"] == 2.0
+        assert body_["proposed_guard_band"] == 4.0
+        assert body_["effective_application_ids"] == [a, b]
+        assert body_["has_conflicts"] is True
+        assert body_["interfering_pair_count"] == 1
+        (pair,) = body_["interfering_pairs"]
+        assert pair["first"]["id"] == a
+        assert pair["second"]["id"] == b
+        assert pair["reason"] == "within_guard_band"
+        assert pair["trigger"] == {
+            "time_intersect": True,
+            "area_intersect": True,
+            "frequency_intersect": False,
+            "minimum_frequency_gap": 3.0,
+            "within_guard_band": True,
+        }
+
+        # preview is non-mutating: band, effective set and revision unchanged
+        cfg = client.get(self.CONFIG).json()
+        assert cfg["guard_band"] == 2.0 and cfg["current_revision"] == 2
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 2
+        assert current["effective_application_ids"] == [a, b]
+
+        # tightening is always safe for the same effective set
+        r2 = client.post(self.PREVIEW, json={"guard_band": 1.0})
+        assert r2.json()["has_conflicts"] is False
+        assert r2.json()["interfering_pairs"] == []
+
+    def test_confirm_consumes_one_revision_and_binds_later_decisions(
+        self, client
+    ):
+        a = self._submit(client, "A", freq=(100, 110))
+        approved = self._approve(client, a, 0)  # revision 1, under band 2.0
+        assert approved["guard_band"] == 2.0
+        b = self._submit(client, "B", freq=(112, 120))  # gap 2 == band: ok
+
+        r = client.post(
+            self.CONFIG, json={"guard_band": 3.0, "expected_revision": 1}
+        )
+        assert r.status_code == 200, r.text
+        body_ = r.json()
+        assert body_["updated"] is True
+        assert body_["revision"] == 2
+        assert body_["previous_guard_band"] == 2.0
+        assert body_["guard_band"] == 3.0
+
+        # exactly one revision was produced; the live band moved
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 2
+        assert current["guard_band"] == 3.0
+
+        # the new band now drives preview and single approval (gap 2 < 3)
+        prev = client.post(f"/api/applications/{b}/preview").json()
+        assert prev["guard_band"] == 3.0
+        assert prev["has_conflicts"] is True
+        blocked = client.post(
+            f"/api/applications/{b}/approve", json={"expected_revision": 2}
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "interference"
+
+        # history restores the band in force at each revision
+        snap1 = client.get("/api/revision/1").json()
+        assert snap1["guard_band"] == 2.0
+        snap2 = client.get("/api/revision/2").json()
+        assert snap2["guard_band"] == 3.0
+        assert [
+            (c["revision"], c["previous_guard_band"], c["guard_band"])
+            for c in snap2["guard_band_changes"]
+        ] == [(0, None, 2.0), (2, 2.0, 3.0)]
+
+        # the earlier approval record keeps the band it was decided under
+        assert snap1["approvals"][0]["guard_band"] == 2.0
+        assert snap2["approvals"][0]["guard_band"] == 2.0
+
+    def test_confirm_with_stale_revision_rejected(self, client):
+        a = self._submit(client, "A")
+        self._approve(client, a, 0)
+
+        r = client.post(
+            self.CONFIG, json={"guard_band": 1.0, "expected_revision": 0}
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "stale_revision"
+        assert err["details"] == {"expected_revision": 0, "current_revision": 1}
+        # nothing changed
+        cfg = client.get(self.CONFIG).json()
+        assert cfg["guard_band"] == 2.0 and cfg["current_revision"] == 1
+
+    def test_confirm_that_would_break_effective_pairs_rejected(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        b = self._submit(client, "B", freq=(113, 114))  # gap 3
+        self._approve(client, a, 0)
+        self._approve(client, b, 1)
+
+        r = client.post(
+            self.CONFIG, json={"guard_band": 4.0, "expected_revision": 2}
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "interference"
+        details = err["details"]
+        assert details["current_revision"] == 2
+        assert details["current_guard_band"] == 2.0
+        assert details["proposed_guard_band"] == 4.0
+        (pair,) = details["interfering_pairs"]
+        assert {pair["first"]["id"], pair["second"]["id"]} == {a, b}
+        assert pair["reason"] == "within_guard_band"
+
+        # band, effective set and revision all unchanged
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 2
+        assert current["guard_band"] == 2.0
+        assert current["effective_application_ids"] == [a, b]
+
+    def test_invalid_values_rejected(self, client):
+        for bad in (-0.5, -1):
+            r = client.post(
+                self.CONFIG,
+                json={"guard_band": bad, "expected_revision": 0},
+            )
+            assert r.status_code == 422, bad
+            assert r.json()["error"]["code"] == "validation_failed"
+            codes = [d["code"] for d in r.json()["error"]["details"]]
+            assert codes == ["guard_band_negative"]
+            r2 = client.post(self.PREVIEW, json={"guard_band": bad})
+            assert r2.status_code == 422, bad
+            assert r2.json()["error"]["code"] == "validation_failed"
+
+        # non-finite literals (JSON allows NaN/Infinity in Python's parser)
+        for raw in ("NaN", "Infinity", "-Infinity"):
+            r = client.post(
+                self.CONFIG,
+                content=(
+                    '{"guard_band": %s, "expected_revision": 0}' % raw
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert r.status_code == 422, raw
+            assert r.json()["error"]["code"] == "validation_failed"
+            codes = [d["code"] for d in r.json()["error"]["details"]]
+            assert codes == ["value_not_finite"]
+            r2 = client.post(
+                self.PREVIEW,
+                content='{"guard_band": %s}' % raw,
+                headers={"Content-Type": "application/json"},
+            )
+            assert r2.status_code == 422, raw
+
+        missing = client.post(self.CONFIG, json={"expected_revision": 0})
+        assert missing.status_code == 422
+        assert missing.json()["error"]["code"] == "validation_failed"
+
+        # nothing consumed by any of the rejections
+        assert client.get(self.CONFIG).json() == {
+            "current_revision": 0,
+            "guard_band": 2.0,
+            "initial_guard_band": 2.0,
+        }
+
+    def test_restart_does_not_overwrite_effective_band(self, client, monkeypatch):
+        from app import db
+        from app.config import settings
+
+        r = client.post(
+            self.CONFIG, json={"guard_band": 5.0, "expected_revision": 0}
+        )
+        assert r.status_code == 200
+
+        # simulate a restart with a different GUARD_BAND: init_db must not
+        # overwrite the live setting
+        monkeypatch.setattr(settings, "guard_band", 9.0)
+        db.init_db()
+
+        cfg = client.get(self.CONFIG).json()
+        assert cfg["guard_band"] == 5.0
+        assert cfg["initial_guard_band"] == 2.0
+        assert cfg["current_revision"] == 1
+        snap = client.get("/api/revision/1").json()
+        assert snap["guard_band"] == 5.0
+
+    def test_shares_revision_arbitration_with_approve_batch_and_revoke(
+        self, client
+    ):
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+
+        # a guard-band change consumes revision 1
+        r = client.post(
+            self.CONFIG, json={"guard_band": 1.5, "expected_revision": 0}
+        )
+        assert r.status_code == 200 and r.json()["revision"] == 1
+
+        # a single approval based on the old revision is stale
+        stale = client.post(
+            f"/api/applications/{a}/approve", json={"expected_revision": 0}
+        )
+        assert stale.status_code == 409
+        assert stale.json()["error"]["code"] == "stale_revision"
+
+        # batch approval shares the same arbitration and the new band
+        batch = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 1, "application_ids": [a, b]},
+        )
+        assert batch.status_code == 200, batch.text
+        assert [x["revision"] for x in batch.json()["results"]] == [2, 3]
+        assert batch.json()["guard_band"] == 1.5
+
+        # a confirm based on a pre-batch revision is stale
+        stale2 = client.post(
+            self.CONFIG, json={"guard_band": 1.0, "expected_revision": 1}
+        )
+        assert stale2.status_code == 409
+        assert stale2.json()["error"]["code"] == "stale_revision"
+
+        # revoke shares the sequence too (revision 4), then confirm (5)
+        rev = client.post(f"/api/applications/{a}/revoke", json={})
+        assert rev.json()["revision"] == 4
+        ok = client.post(
+            self.CONFIG, json={"guard_band": 1.0, "expected_revision": 4}
+        )
+        assert ok.status_code == 200 and ok.json()["revision"] == 5
+
+    def test_batch_approval_uses_the_new_band(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        b = self._submit(client, "B", freq=(112.5, 113))  # intra-group gap 2.5
+        ok = client.post(
+            self.CONFIG, json={"guard_band": 3.0, "expected_revision": 0}
+        )
+        assert ok.status_code == 200
+
+        # would have passed under the old band 2.0; rejected under 3.0
+        r = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 1, "application_ids": [a, b]},
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "interference"
+        sides = {
+            x["application_id"]: [c["scope"] for c in x["conflicts"]]
+            for x in err["details"]["applications"]
+        }
+        assert sides == {a: ["group"], b: ["group"]}
+        # both still pending, revision unchanged
+        for app_id in (a, b):
+            assert (
+                client.get(f"/api/applications/{app_id}").json()["status"]
+                == "pending"
+            )
+        assert client.get("/api/revision/current").json()["current_revision"] == 1

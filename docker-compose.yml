@@ -24,6 +24,9 @@ services:
       DATABASE_URL: postgresql+psycopg2://radio:radio@db:5432/radio
       # Non-negative protection bandwidth; same unit as frequency numbers.
       # The examples in the README use MHz, so this is 2 MHz.
+      # Initial value only (seeded into a fresh database); afterwards change
+      # it online via POST /api/config/guard-band - restarts keep the live
+      # setting stored in the database.
       GUARD_BAND: "2.0"
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"

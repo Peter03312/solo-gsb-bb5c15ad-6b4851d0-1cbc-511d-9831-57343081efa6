@@ -13,6 +13,13 @@
   修订号不变**；全部通过时按输入顺序为每项写入批准事件与连续修订号，一次提交
 - 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
   （整组中的每个修订号都可单独还原截至该项获批时的有效集合）
+- **保护带宽在线调整**：`GUARD_BAND` 环境变量仅作全新数据库的初值；之后通过
+  `POST /api/config/guard-band` 在线变更——先预览（新带宽下当前全部有效许可之间的
+  干扰许可对，不改状态），再携同一拟定值与预期修订号确认。确认与单笔/整组批准、
+  撤销**共用同一修订号裁决**；修订号过期或拟定值使任意有效许可对互扰即拒绝
+  （带宽、有效集合、修订号均不变）；通过只产生**一个**修订号，后续预览与批准统一
+  使用新带宽。历史修订查询可还原当时带宽与有效集合，已有批准记录保存的裁决带宽
+  不被追改，重启不覆盖已生效设置
 
 ---
 
@@ -59,7 +66,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 47 个用例）：
+运行测试（自动使用临时 SQLite 库，共 62 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -73,7 +80,7 @@ pytest -q
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql+psycopg2://radio:radio@localhost:5432/radio` | SQLAlchemy 数据库连接串 |
-| `GUARD_BAND` | `0` | **非负**保护带宽，与频率数字同单位（示例统一用 MHz，即 2.0 = 2 MHz） |
+| `GUARD_BAND` | `0` | **非负有限**保护带宽的**初始值**，仅在建库（或从旧版升级）时写入一次；生效值存于数据库，之后用 `POST /api/config/guard-band` 在线变更，**重启不会覆盖已生效设置**。与频率数字同单位（示例统一用 MHz，即 2.0 = 2 MHz） |
 | `APP_HOST` | `0.0.0.0` | 监听地址 |
 | `APP_PORT` | `8000` | 监听端口 |
 
@@ -122,11 +129,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 ### 修订号与并发模型
 
-- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准或撤销都使修订号 +1，
-  并追加一条不可变事件。
+- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、撤销或**保护带宽变更**
+  都使修订号 +1，并追加一条不可变事件。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
-  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销事务：
+  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
   - `expected_revision != 当前修订号` → **409 `stale_revision`**（修订过期/被并发抢先）；
   - 号对但锁内**重新裁决**发现冲突 → **409 `interference`**（不得占用频段，响应体附冲突）；
   - 通过 → 写入批准事件，占用新修订号。
@@ -142,11 +149,35 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   - 全部通过时**按输入顺序**为每项写一条批准事件，占用连续修订号
     `n+1, n+2, …`，整组**一次提交**；按其中任一修订号查询 `/api/revision/{k}`，
     即还原截至该项获批时的有效集合。
-- 并发单笔批准、整组批准或撤销在同一锁（SQLite 退化为唯一修订号约束兜底）上裁决，
-  胜者提交、其余返回 `stale_revision`，**不会产生部分获批或互相干扰的有效许可**。
+- 并发单笔批准、整组批准、撤销或带宽变更在同一锁（SQLite 退化为唯一修订号约束兜底）
+  上裁决，胜者提交、其余返回 `stale_revision`，**不会产生部分获批或互相干扰的有效许可**。
 - `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除。
-- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录
-  （`n` 超过当前修订号返回 404）。
+- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录、**当时生效的保护
+  带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
+
+### 保护带宽的在线调整
+
+裁决使用的保护带宽是**数据库中的生效值**（`revision_meta` 单行），`GUARD_BAND`
+环境变量只在建库（或从旧版库升级）时写入一次，之后重启不再覆盖。运营人员在线
+调整分两步：
+
+1. **预览** `POST /api/config/guard-band/preview`，请求体 `{"guard_band": 拟定值}`。
+   返回当前修订号、当前带宽、拟定带宽，以及**拟定带宽下当前全部有效许可之间**
+   会互扰的许可对（含每项触发条件）。预览**不改变任何状态**。
+2. **确认** `POST /api/config/guard-band`，请求体
+   `{"guard_band": 同一拟定值, "expected_revision": 预览拿到的修订号}`。
+   与单笔/整组批准、撤销**共用同一把修订号锁**：
+   - 修订号过期 → **409 `stale_revision`**；
+   - 拟定值使任意有效许可对互扰 → **409 `interference`**（响应体附许可对与触发
+     条件）；两种拒绝下**带宽、有效集合、修订号均不变**；
+   - 通过 → 修订号 **+1（只产生一个）**，追加一条不可变带宽变更事件，后续申请
+     预览及单笔、整组批准统一使用新带宽。
+
+拟定值必须是**有限的非负数**，否则 **422 `validation_failed`**（明细码
+`value_not_finite` / `guard_band_negative`）。`GET /api/config/guard-band`
+可随时查看当前生效值、初始值与当前修订号。历史修订查询
+（`GET /api/revision/{n}`）可还原**当时**的带宽与有效集合；已有批准事件各自
+保存裁决时所用带宽的快照，**不被追改**。
 
 ---
 
@@ -161,8 +192,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
 | `POST` | `/api/applications/batch-approve` | **整组原子批准**（预期修订号 + 非空无重复 ID 列表） |
 | `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
-| `GET` | `/api/revision/current` | 当前修订号 + 有效集合 + 全部事件 |
-| `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录 |
+| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 全部事件 |
+| `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
+| `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
+| `POST` | `/api/config/guard-band/preview` | 拟定带宽预览（新带宽下有效许可间的干扰对；不改状态） |
+| `POST` | `/api/config/guard-band` | 确认新带宽（拟定值 + 预期修订号；共享修订号裁决） |
 | `GET` | `/health` | 存活探针 |
 
 所有错误使用统一信封：
@@ -173,13 +207,13 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id` |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`） |
 | 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构） |
-| 409 | `stale_revision` | 修订号过期或被并发批准抢占（单笔/整组/撤销共享裁决） |
-| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`） |
+| 409 | `stale_revision` | 修订号过期或被并发批准抢占（单笔/整组/撤销/带宽变更共享裁决） |
+| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件） |
 
 ---
 
@@ -433,6 +467,97 @@ curl -i -X POST .../batch-approve -d '{"expected_revision": 0, "application_ids"
 #   "details": {"expected_revision": 0, "current_revision": 3}}}
 ```
 
+### 6.14 保护带宽在线调整（预览 → 确认 → 历史还原）
+
+设当前带宽为 **2 MHz**、修订号为 2，有效集合中有两个许可：A `[100,110]` 与
+B `[113,114]`（最短间隔 3 MHz，同地同时段）。
+
+**第 1 步：查看当前配置**
+
+```bash
+curl -s http://localhost:8000/api/config/guard-band
+# {"current_revision": 2, "guard_band": 2.0, "initial_guard_band": 2.0}
+```
+
+**第 2 步：预览拟定带宽 4 MHz（不改状态）**——新带宽下 A、B 间隔 3 < 4，会互扰：
+
+```bash
+curl -s -X POST http://localhost:8000/api/config/guard-band/preview \
+  -H 'Content-Type: application/json' -d '{"guard_band": 4.0}'
+```
+
+```json
+{"current_revision": 2, "current_guard_band": 2.0, "proposed_guard_band": 4.0,
+ "effective_application_ids": [1, 2],
+ "has_conflicts": true, "interfering_pair_count": 1,
+ "interfering_pairs": [{
+   "first":  {"id": 1, "frequency": {"low": 100.0, "high": 110.0}, ...},
+   "second": {"id": 2, "frequency": {"low": 113.0, "high": 114.0}, ...},
+   "trigger": {"time_intersect": true, "area_intersect": true,
+               "frequency_intersect": false, "minimum_frequency_gap": 3.0,
+               "within_guard_band": true},
+   "reason": "within_guard_band"}]}
+```
+
+**第 3 步：确认该拟定值 → 拒绝（409），带宽/有效集合/修订号均不变**
+
+```bash
+curl -i -X POST http://localhost:8000/api/config/guard-band \
+  -H 'Content-Type: application/json' \
+  -d '{"guard_band": 4.0, "expected_revision": 2}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "interference",
+#   "message": "proposed guard band 4.0 would make 1 effective license pair(s) interfere; ...",
+#   "details": {"current_revision": 2, "current_guard_band": 2.0,
+#               "proposed_guard_band": 4.0, "interfering_pairs": [ ...同上... ]}}}
+```
+
+**第 4 步：改设为收紧的 1 MHz → 通过，恰好产生一个修订号（3）**
+
+```bash
+curl -s -X POST http://localhost:8000/api/config/guard-band \
+  -H 'Content-Type: application/json' \
+  -d '{"guard_band": 1.0, "expected_revision": 2}'
+# {"updated": true, "revision": 3, "previous_guard_band": 2.0, "guard_band": 1.0}
+```
+
+此后申请预览、单笔与整组批准统一使用 **1 MHz**；携带旧修订号的确认/批准
+返回 `stale_revision`：
+
+```bash
+curl -i -X POST http://localhost:8000/api/config/guard-band \
+  -H 'Content-Type: application/json' \
+  -d '{"guard_band": 0.5, "expected_revision": 2}'
+# HTTP/1.1 409 Conflict {"error": {"code": "stale_revision",
+#   "details": {"expected_revision": 2, "current_revision": 3}}}
+```
+
+**第 5 步：历史还原**——按修订号查询可还原当时带宽与有效集合；已有批准
+记录保存的裁决带宽不被追改：
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "guard_band": 2.0,                 <- 当时的带宽
+#  "guard_band_changes": [{"revision": 0, "previous_guard_band": null, "guard_band": 2.0, ...}],
+#  "approvals": [{"revision": 1, "guard_band": 2.0, ...}, ...], ...}
+
+curl -s http://localhost:8000/api/revision/3
+# {"revision": 3, "guard_band": 1.0,
+#  "guard_band_changes": [{"revision": 0, ..., "guard_band": 2.0},
+#                         {"revision": 3, "previous_guard_band": 2.0, "guard_band": 1.0}], ...}
+```
+
+无效拟定值被明确拒绝（422，修订号不变）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/config/guard-band \
+  -H 'Content-Type: application/json' \
+  -d '{"guard_band": -1, "expected_revision": 3}'
+# HTTP/1.1 422 {"error": {"code": "validation_failed",
+#   "details": [{"field": "guard_band", "code": "guard_band_negative",
+#                "message": "guard_band must be non-negative"}]}}
+```
+
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`）。
 
@@ -443,13 +568,13 @@ curl -i -X POST .../batch-approve -d '{"expected_revision": 0, "application_ids"
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准）
-│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两裁决）
-│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销事件 + 修订号）
-│   ├── db.py                   # 引擎、等待数据库、建表与修订号初始化
-│   ├── config.py               # 环境变量配置
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准与带宽在线配置）
+│   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两与有效集成对检查）
+│   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽校验）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、GuardBand*Request）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销/带宽事件 + 修订号/当前带宽）
+│   ├── db.py                   # 引擎、等待数据库、建表、修订号与带宽初值初始化（重启不覆盖）
+│   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
 ├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite）
 ├── examples/walkthrough.sh     # curl 走查脚本

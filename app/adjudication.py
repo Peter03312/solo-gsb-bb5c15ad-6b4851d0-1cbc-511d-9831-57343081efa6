@@ -57,6 +57,23 @@ class Conflict:
     reason: str  # REASON_*; only set when all three trigger conditions hold
 
 
+@dataclass(frozen=True)
+class PairConflict:
+    """An interfering pair inside a set of licenses (symmetric view).
+
+    Used when a whole set is checked against itself, e.g. previewing a
+    proposed guard band against the current effective set.
+    """
+
+    first: License
+    second: License
+    time_overlap: bool
+    area_overlap: bool
+    frequency_intersects: bool
+    minimum_frequency_gap: float
+    reason: str  # REASON_*
+
+
 def circles_intersect(a: Circle, b: Circle) -> bool:
     """Planar disks intersect iff centre distance <= sum of radii.
 
@@ -110,46 +127,85 @@ def frequency_conflicts(
     return False, False, gap, None
 
 
+def _pair_trigger(
+    a: License, b: License, guard_band: float
+) -> tuple[bool, float, str] | None:
+    """Shared interference gate for one pair of licenses.
+
+    Returns ``(frequency_intersects, minimum_gap, reason)`` when the pair
+    interferes under ``guard_band``, else ``None``.  Time and area
+    intersection are necessary conditions; frequency overlap (or a
+    guard-band violation) is the third.
+    """
+    t_overlap = half_open_intervals_intersect(
+        a.start_time, a.end_time, b.start_time, b.end_time
+    )
+    a_overlap = circles_intersect(a.circle, b.circle)
+    if not (t_overlap and a_overlap):
+        return None
+    freq_conflicts, freq_intersects, gap, reason = frequency_conflicts(
+        a.freq_low, a.freq_high, b.freq_low, b.freq_high, guard_band
+    )
+    if not freq_conflicts:
+        return None
+    return freq_intersects, gap, (reason or REASON_FREQUENCY_INTERSECTION)
+
+
 def evaluate(
     candidate: License, effective: list[License], guard_band: float
 ) -> list[Conflict]:
     """All interference conflicts between ``candidate`` and effective grants.
 
-    Time and area intersection are *necessary* conditions; frequency overlap
-    (or guard-band violation) is the third.  Every checked grant is returned
-    with its trigger flags so callers can preview exactly which conditions
-    fired.
+    Every checked grant is returned with its trigger flags so callers can
+    preview exactly which conditions fired.
     """
     conflicts: list[Conflict] = []
     for other in effective:
-        t_overlap = half_open_intervals_intersect(
-            candidate.start_time,
-            candidate.end_time,
-            other.start_time,
-            other.end_time,
-        )
-        a_overlap = circles_intersect(candidate.circle, other.circle)
-        if not (t_overlap and a_overlap):
+        trigger = _pair_trigger(candidate, other, guard_band)
+        if trigger is None:
             continue
-        freq_conflicts, freq_intersects, gap, reason = frequency_conflicts(
-            candidate.freq_low,
-            candidate.freq_high,
-            other.freq_low,
-            other.freq_high,
-            guard_band,
+        freq_intersects, gap, reason = trigger
+        conflicts.append(
+            Conflict(
+                other=other,
+                time_overlap=True,
+                area_overlap=True,
+                frequency_intersects=freq_intersects,
+                minimum_frequency_gap=gap,
+                reason=reason,
+            )
         )
-        if freq_conflicts:
-            conflicts.append(
-                Conflict(
-                    other=other,
+    return conflicts
+
+
+def find_interfering_pairs(
+    licenses: list[License], guard_band: float
+) -> list[PairConflict]:
+    """Every interfering pair *within* ``licenses`` under ``guard_band``.
+
+    Used to (pre-)check a proposed guard band against the current effective
+    set: the change may only be confirmed when this returns an empty list.
+    Each interfering combination is reported once, in input order.
+    """
+    pairs: list[PairConflict] = []
+    for i in range(len(licenses)):
+        for j in range(i + 1, len(licenses)):
+            trigger = _pair_trigger(licenses[i], licenses[j], guard_band)
+            if trigger is None:
+                continue
+            freq_intersects, gap, reason = trigger
+            pairs.append(
+                PairConflict(
+                    first=licenses[i],
+                    second=licenses[j],
                     time_overlap=True,
                     area_overlap=True,
                     frequency_intersects=freq_intersects,
                     minimum_frequency_gap=gap,
-                    reason=reason or REASON_FREQUENCY_INTERSECTION,
+                    reason=reason,
                 )
             )
-    return conflicts
+    return pairs
 
 
 def evaluate_group(

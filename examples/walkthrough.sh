@@ -95,3 +95,31 @@ post /api/applications/batch-approve \
   "{\"expected_revision\":6,\"application_ids\":[$F_ID,$F_ID]}" | J || true
 post /api/applications/batch-approve \
   "{\"expected_revision\":6,\"application_ids\":[999999]}" | J || true
+
+echo "== 16. guard band: current config (live value, initial value, revision) =="
+curl -s "$BASE/api/config/guard-band" | J
+
+echo "== 17. preview a wider band (100): pairs among the effective grants appear =="
+echo "    (devices C/D/E sit 90 MHz apart; B's time window does not overlap theirs)"
+post /api/config/guard-band/preview '{"guard_band":100}' | J
+
+echo "== 18. confirming it is refused (409 interference); nothing changes =="
+post /api/config/guard-band '{"guard_band":100,"expected_revision":6}' | J || true
+curl -s "$BASE/api/config/guard-band" | J
+
+echo "== 19. tighten to 1.0: accepted, exactly one new revision (7) =="
+post /api/config/guard-band '{"guard_band":1.0,"expected_revision":6}' | J
+
+echo "== 20. the change shares revision arbitration: stale confirms/approvals lose =="
+post /api/config/guard-band '{"guard_band":0.5,"expected_revision":6}' | J || true
+post "/api/applications/$F_ID/approve" '{"expected_revision":6}' | J || true
+
+echo "== 21. invalid values are rejected with 422 (no revision consumed) =="
+post /api/config/guard-band '{"guard_band":-5,"expected_revision":7}' | J || true
+
+echo "== 22. history restores the band in force at each revision =="
+curl -s "$BASE/api/revision/6" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revision", d["revision"], "guard_band =", d["guard_band"])'
+curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("revision", d["revision"], "guard_band =", d["guard_band"], "changes =", [(c["revision"], c["previous_guard_band"], c["guard_band"]) for c in d["guard_band_changes"]])'
+echo "    approval events keep the band they were decided under (not rewritten):"
+curl -s "$BASE/api/revision/7" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("approval guard_bands =", [(a["revision"], a["guard_band"]) for a in d["approvals"]])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "guard_band =", d["guard_band"])'

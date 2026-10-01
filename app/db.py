@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
@@ -34,13 +34,62 @@ def wait_for_database(timeout_seconds: float = 60.0) -> None:
             time.sleep(1.0)
 
 
+def _ensure_guard_band_column() -> None:
+    """Add ``revision_meta.guard_band`` to databases created before it existed.
+
+    ``create_all`` never alters existing tables, so the column is added with
+    a plain idempotent ``ALTER TABLE``; its value is backfilled in
+    ``init_db`` from the ``GUARD_BAND`` environment variable, which was the
+    operative setting before online configuration existed.
+    """
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("revision_meta")}
+    if "guard_band" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE revision_meta ADD COLUMN guard_band FLOAT")
+        )
+
+
 def init_db() -> None:
-    """Create tables and seed the singleton revision row (revision 0)."""
+    """Create tables and seed the singleton revision row (revision 0).
+
+    The guard band is seeded from ``GUARD_BAND`` only on a brand-new
+    database (or backfilled once into databases created before online
+    guard-band configuration existed).  An already-effective setting is
+    never overwritten at startup: restarts keep the live value.
+    """
     # Imported here so models register on Base.metadata before create_all().
     from . import models  # noqa: F401
-    from .models import Base, RevisionMeta
+    from .models import Base, GuardBandEvent, RevisionMeta
 
     Base.metadata.create_all(bind=engine)
+    _ensure_guard_band_column()
     with SessionLocal() as session, session.begin():
-        if session.get(RevisionMeta, 1) is None:
-            session.add(RevisionMeta(id=1, revision=0))
+        meta = session.get(RevisionMeta, 1)
+        if meta is None:
+            meta = RevisionMeta(
+                id=1, revision=0, guard_band=settings.guard_band
+            )
+            session.add(meta)
+            session.flush()
+        elif meta.guard_band is None:
+            # Database predates online guard-band configuration: the
+            # GUARD_BAND env var was the operative setting, adopt it once.
+            meta.guard_band = settings.guard_band
+        seed = (
+            session.query(GuardBandEvent)
+            .filter(GuardBandEvent.revision == 0)
+            .first()
+        )
+        if seed is None:
+            # Initial-value record so every historical revision snapshot can
+            # restore the band in force at that time.
+            session.add(
+                GuardBandEvent(
+                    revision=0,
+                    previous_guard_band=None,
+                    guard_band=meta.guard_band,
+                )
+            )

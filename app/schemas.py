@@ -61,3 +61,18 @@ class BatchApprovalRequest(BaseModel):
 
 class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
+
+
+class GuardBandPreviewRequest(BaseModel):
+    # Proposed guard band to dry-run against the current effective set.
+    # Finite/non-negative checks run in semantic_validation so they use the
+    # standard error envelope.
+    guard_band: float
+
+
+class GuardBandUpdateRequest(BaseModel):
+    # Confirm a previously previewed value: the same proposed band plus the
+    # revision the decision was based on.  Shares revision arbitration with
+    # single/batch approvals and revocations.
+    guard_band: float
+    expected_revision: int = Field(ge=0)
